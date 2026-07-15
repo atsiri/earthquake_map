@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, shrink-to-fit=no"
+    />
+    <title>Stlite app</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.90.7/build/stlite.css"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.90.7/build/stlite.js"
+mount(
+  {
+    requirements: ["streamlit", "streamlit-folium", "folium", "pandas", "requests"],
+    entrypoint: "app.py",
+    files: {
+"app.py": `import streamlit as st
+import pandas as pd
+import folium
+import json
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
+
+# Set page configuration
+st.set_page_config(layout="wide", page_title="Earthquake Monitoring Dashboard")
+
+# -----------------------------------------------------------------------------
+# 1. DATA LOADING FUNCTION
+# -----------------------------------------------------------------------------
+@st.cache_data
+def load_data(filepath="data.geojson"):
+    # Load data from the local GeoJSON file
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            geo_data = json.load(f)
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
+        return pd.DataFrame()
+
+    table_rows = []
+    # Parse the standard GeoJSON FeatureCollection structure
+    for feature in geo_data.get('features', []):
+        props = feature.get('properties', {})
+        coords = feature.get('geometry', {}).get('coordinates', [0, 0, 0])
+        
+        # GeoJSON coordinates are formatted as: [longitude, latitude, depth]
+        lon, lat, depth = coords[0], coords[1], coords[2]
+        
+        table_rows.append({
+            'Magnitude': props.get('mag'),
+            'Place': props.get('place'),
+            'Depth (km)': depth,
+            # The GeoJSON time is an ISO string, so we let pandas infer the datetime format
+            'Date': pd.to_datetime(props.get('time')).date(),
+            'Latitude': lat,
+            'Longitude': lon
+        })
+        
+    return pd.DataFrame(table_rows)
+
+df_raw = load_data()
+
+if df_raw.empty:
+    st.warning("No data found or failed to parse.")
+    st.stop()
+
+# -----------------------------------------------------------------------------
+# 2. SIDEBAR FILTERS
+# -----------------------------------------------------------------------------
+st.sidebar.title("Filters")
+
+# --- Filter 1: Magnitude ---
+min_mag = float(df_raw['Magnitude'].min())
+max_mag = float(df_raw['Magnitude'].max())
+mag_range = st.sidebar.slider(
+    "Select Magnitude Range", 
+    min_value=min_mag, 
+    max_value=max_mag, 
+    value=(min_mag, max_mag), 
+    step=0.1
+)
+
+# --- Filter 2: Date Range ---
+min_date = df_raw['Date'].min()
+max_date = df_raw['Date'].max()
+date_range = st.sidebar.date_input(
+    "Select Date Range", 
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date
+)
+
+# --- Filter 3: Search Location ---
+search_location = st.sidebar.text_input("Search Location / Country Name", "").strip()
+
+# --- Filter 4: Show M6.0+ Scatter Points ---
+show_m6_scatter = st.sidebar.checkbox("Show M ≥ 6.0 Earthquake Points", value=True)
+
+# -----------------------------------------------------------------------------
+# 3. APPLY FILTERS TO DATAFRAME
+# -----------------------------------------------------------------------------
+# Apply Magnitude filter
+df_filtered = df_raw[
+    (df_raw['Magnitude'] >= mag_range[0]) & 
+    (df_raw['Magnitude'] <= mag_range[1])
+]
+
+# Apply Date filter (handles case where user selects a single date vs a range)
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    df_filtered = df_filtered[
+        (df_filtered['Date'] >= date_range[0]) & 
+        (df_filtered['Date'] <= date_range[1])
+    ]
+elif isinstance(date_range, tuple) and len(date_range) == 1:
+    df_filtered = df_filtered[df_filtered['Date'] == date_range[0]]
+
+# Apply Location filter
+if search_location:
+    df_filtered = df_filtered[df_filtered['Place'].str.contains(search_location, case=False, na=False)]
+
+# -----------------------------------------------------------------------------
+# 4. MAIN LAYOUT & RENDERING
+# -----------------------------------------------------------------------------
+st.title("Earthquake Hazard Density Analysis")
+
+# High-level metrics row
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Events Displayed", len(df_filtered))
+if not df_filtered.empty:
+    col2.metric("Max Magnitude", f"M {df_filtered['Magnitude'].max():.1f}")
+    col3.metric("Avg Depth", f"{df_filtered['Depth (km)'].mean():.1f} km")
+else:
+    col2.metric("Max Magnitude", "N/A")
+    col3.metric("Avg Depth", "N/A")
+
+st.markdown("---")
+
+if not df_filtered.empty:
+    st.subheader("Global Seismic Density Map")
+    
+    # 1. Initialize Folium Map
+    m = folium.Map(location=[0, 120], zoom_start=2, tiles='CartoDB positron')
+    
+    # 2. Extract [latitude, longitude] pairs and add the HeatMap layer
+    heat_data = df_filtered[['Latitude', 'Longitude']].values.tolist()
+    
+    transparent_gradient = {
+        0.2: 'rgba(0, 0, 255, 0.4)',
+        0.4: 'rgba(0, 255, 255, 0.5)',
+        0.6: 'rgba(0, 255, 0, 0.6)',
+        0.8: 'rgba(255, 255, 0, 0.7)',
+        1.0: 'rgba(255, 0, 0, 0.8)'
+    }
+    
+    HeatMap(
+        heat_data, 
+        radius=15, 
+        blur=10, 
+        max_zoom=1,
+        min_opacity=0.1,
+        gradient=transparent_gradient
+    ).add_to(m)
+
+    # 3. SPATIAL AGGREGATION FOR HOVER TOOLTIPS
+    df_agg = df_filtered.copy()
+    df_agg['Lat_Bin'] = df_agg['Latitude'].round(0)
+    df_agg['Lon_Bin'] = df_agg['Longitude'].round(0)
+    
+    df_agg = df_agg.sort_values('Magnitude', ascending=False)
+    
+    grouped = df_agg.groupby(['Lat_Bin', 'Lon_Bin']).agg(
+        Num_Earthquakes=('Magnitude', 'count'),
+        Max_Mag=('Magnitude', 'first'),
+        Max_Mag_Date=('Date', 'first'),
+        Area_Details=('Place', 'first'), 
+        Lat_Center=('Latitude', 'mean'), 
+        Lon_Center=('Longitude', 'mean')
+    ).reset_index()
+
+    # 4. Overlay invisible interactive markers for general area hover info
+    for _, row in grouped.iterrows():
+        tooltip_html = f"""
+        <div style="font-family: sans-serif; font-size: 14px; min-width: 200px;">
+            <b>Area:</b> {row['Area_Details']}<br>
+            <b>Earthquakes in Area:</b> {row['Num_Earthquakes']}<br>
+            <b>Highest Magnitude:</b> M {row['Max_Mag']} (on {row['Max_Mag_Date']})
+        </div>
+        """
+        
+        folium.CircleMarker(
+            location=[row['Lat_Center'], row['Lon_Center']],
+            radius=18,                  
+            color='rgba(0,0,0,0)',      
+            fill=True,
+            fill_color='rgba(0,0,0,0)', 
+            tooltip=tooltip_html
+        ).add_to(m)
+
+    # 5. Overlay specific scatter points for M >= 6.0 earthquakes if checked
+    if show_m6_scatter:
+        df_m6_plus = df_filtered[df_filtered['Magnitude'] >= 6.0]
+        
+        if not df_m6_plus.empty:
+            max_m6_mag = df_m6_plus['Magnitude'].max()
+            
+            for _, row in df_m6_plus.iterrows():
+                mag = row['Magnitude']
+                
+                # Calculate color dynamically: Yellow (6.0) to Red (Max Magnitude)
+                if max_m6_mag > 6.0:
+                    ratio = (mag - 6.0) / (max_m6_mag - 6.0)
+                else:
+                    ratio = 1.0  # Default to red if all points are exactly 6.0
+                
+                # Green channel scales from 255 (Yellow) to 0 (Red)
+                g_val = int(255 * (1 - ratio))
+                color_hex = f'#ff{g_val:02x}00'
+                
+                m6_tooltip_html = f"""
+                <div style="font-family: sans-serif; font-size: 14px; min-width: 220px; color: #333;">
+                    <h4 style="margin-top: 0; color: {color_hex}; text-shadow: 1px 1px 1px #000;">⚠️ Major Earthquake</h4>
+                    <b>Magnitude:</b> {mag}<br>
+                    <b>Location:</b> {row['Place']}<br>
+                    <b>Date:</b> {row['Date']}<br>
+                    <b>Depth:</b> {row['Depth (km)']} km<br>
+                    <b>Coords:</b> {row['Latitude']:.4f}, {row['Longitude']:.4f}
+                </div>
+                """
+                
+                folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=2,
+                    color='black',
+                    weight=1,
+                    fill=True,
+                    fill_color=color_hex,
+                    fill_opacity=0.9,
+                    tooltip=m6_tooltip_html
+                ).add_to(m)
+    
+    # 6. Render map back into Streamlit canvas
+    st_folium(m, width=1400, height=500, returned_objects=[])
+    
+    st.markdown("---")
+    
+    st.subheader("Data Details")
+    st.dataframe(
+        df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date']], 
+        use_container_width=True, 
+        hide_index=True
+    )
+else:
+    st.info("No earthquake records match the selected sidebar filters. Try expanding your search bounds.")`,
+"data.geojson": `{
+"type": "FeatureCollection",
+"name": "data_sample",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::4979" } },
+"features": [
+{ "type": "Feature", "properties": { "mag": 2.58, "place": "10 km NNE of Covelo, CA", "time": "2026-07-15T08:55:22.359", "updated": "2026-07-15T09:27:20.211", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75396201", "alert": null, "felt": null, "tsunami": 0, "types": ",focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.6 - 10 km NNE of Covelo, CA" }, "geometry": { "type": "Point", "coordinates": [ -123.223663330077997, 39.880001068115199, 7.90999984741211 ] } },
+{ "type": "Feature", "properties": { "mag": 2.9447880878308301, "place": "9 km SE of Ocotillo Wells, CA", "time": "2026-07-15T08:48:55.940", "updated": "2026-07-15T09:00:08.245", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/ci40655194", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.9 - 9 km SE of Ocotillo Wells, CA" }, "geometry": { "type": "Point", "coordinates": [ -116.056503295897997, 33.095165252685497, 9.27999973297119 ] } },
+{ "type": "Feature", "properties": { "mag": 2.6, "place": "48 km SSE of Denali National Park, Alaska", "time": "2026-07-15T08:47:11.996", "updated": "2026-07-15T08:48:45.165", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwvvyi", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - 48 km SSE of Denali National Park, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -151.48, 63.122, 0.7 ] } },
+{ "type": "Feature", "properties": { "mag": 2.6, "place": "41 km NW of Toyah, Texas", "time": "2026-07-15T07:45:52.053", "updated": "2026-07-15T07:57:28.320", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/tx2026nuobbt", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - 41 km NW of Toyah, Texas" }, "geometry": { "type": "Point", "coordinates": [ -104.139, 31.543, 9.2786 ] } },
+{ "type": "Feature", "properties": { "mag": 2.56, "place": "18 km NE of Pāhala, Hawaii", "time": "2026-07-15T06:23:01.390", "updated": "2026-07-15T06:26:44.350", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/hv75002821", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - 18 km NE of Pāhala, Hawaii" }, "geometry": { "type": "Point", "coordinates": [ -155.348007202148011, 19.309667587280298, 28.620000839233398 ] } },
+{ "type": "Feature", "properties": { "mag": 2.6, "place": "Rat Islands, Aleutian Islands, Alaska", "time": "2026-07-15T05:06:22.948", "updated": "2026-07-15T08:08:10.818", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwomak", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - Rat Islands, Aleutian Islands, Alaska" }, "geometry": { "type": "Point", "coordinates": [ 178.337, 51.753, 134.2 ] } },
+{ "type": "Feature", "properties": { "mag": 2.6, "place": "102 km SE of False Pass, Alaska", "time": "2026-07-15T04:51:40.094", "updated": "2026-07-15T08:06:52.689", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwnztp", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - 102 km SE of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -162.435, 54.132, 8.9 ] } },
+{ "type": "Feature", "properties": { "mag": 2.71, "place": "9 km ESE of Coso Junction, CA", "time": "2026-07-15T04:46:40.769", "updated": "2026-07-15T04:59:42.342", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/ci40655106", "alert": null, "felt": 2.0, "tsunami": 0, "types": ",dyfi,focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.7 - 9 km ESE of Coso Junction, CA" }, "geometry": { "type": "Point", "coordinates": [ -117.852333333332993, 36.027833333333298, 2.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.2, "place": "56 km NW of Valparaíso, Chile", "time": "2026-07-15T04:18:07.584", "updated": "2026-07-15T04:54:44.870", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0kl", "alert": null, "felt": 0.0, "tsunami": 0, "types": ",dyfi,moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 4.2 - 56 km NW of Valparaíso, Chile" }, "geometry": { "type": "Point", "coordinates": [ -71.9864, -32.626, 32.33 ] } },
+{ "type": "Feature", "properties": { "mag": 2.56, "place": "4 km NNW of Hydesville, CA", "time": "2026-07-15T04:02:40.519", "updated": "2026-07-15T04:37:20.269", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75396126", "alert": null, "felt": null, "tsunami": 0, "types": ",focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.6 - 4 km NNW of Hydesville, CA" }, "geometry": { "type": "Point", "coordinates": [ -124.109664916992003, 40.582164764404297, 25.690000534057599 ] } },
+{ "type": "Feature", "properties": { "mag": 2.8, "place": "17 km SSW of Petersville, Alaska", "time": "2026-07-15T03:45:48.450", "updated": "2026-07-15T07:56:03.401", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwlupu", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 17 km SSW of Petersville, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -150.936, 62.356, 78.5 ] } },
+{ "type": "Feature", "properties": { "mag": 4.7, "place": "146 km SSE of Vilyuchinsk, Russia", "time": "2026-07-15T03:36:18.242", "updated": "2026-07-15T04:22:15.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0ke", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.7 - 146 km SSE of Vilyuchinsk, Russia" }, "geometry": { "type": "Point", "coordinates": [ 159.5055, 51.7994, 49.52 ] } },
+{ "type": "Feature", "properties": { "mag": 4.9, "place": "183 km SSE of Vilyuchinsk, Russia", "time": "2026-07-15T02:48:45.190", "updated": "2026-07-15T03:03:25.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0k4", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.9 - 183 km SSE of Vilyuchinsk, Russia" }, "geometry": { "type": "Point", "coordinates": [ 159.6733, 51.4762, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 5.1, "place": "190 km SSE of Vilyuchinsk, Russia", "time": "2026-07-15T02:42:18.065", "updated": "2026-07-15T02:56:56.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0k1", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 5.1 - 190 km SSE of Vilyuchinsk, Russia" }, "geometry": { "type": "Point", "coordinates": [ 159.5815, 51.3809, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.5, "place": "110 km SW of Santiago, Peru", "time": "2026-07-15T02:40:26.197", "updated": "2026-07-15T04:28:44.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0k0", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.5 - 110 km SW of Santiago, Peru" }, "geometry": { "type": "Point", "coordinates": [ -76.448, -14.877, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.9, "place": "148 km SW of Adak, Alaska", "time": "2026-07-15T02:30:56.871", "updated": "2026-07-15T07:40:25.032", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwjhrc", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.9 - 148 km SW of Adak, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -178.379, 51.104, 15.4 ] } },
+{ "type": "Feature", "properties": { "mag": 2.5, "place": "173 km SSE of Adak, Alaska", "time": "2026-07-15T01:41:43.976", "updated": "2026-07-15T07:36:11.126", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwhrbj", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.5 - 173 km SSE of Adak, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -175.969, 50.369, 20.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.61, "place": "4 km S of Guánica, Puerto Rico", "time": "2026-07-15T01:34:00.869", "updated": "2026-07-15T01:48:46.680", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71524378", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - 4 km S of Guánica, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.910166666666697, 17.9305, 14.43 ] } },
+{ "type": "Feature", "properties": { "mag": 5.1, "place": "52 km NNW of Valparaíso, Chile", "time": "2026-07-15T01:09:20.401", "updated": "2026-07-15T02:08:47.608", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0it", "alert": null, "felt": 18.0, "tsunami": 0, "types": ",dyfi,internal-moment-tensor,moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 5.1 - 52 km NNW of Valparaíso, Chile" }, "geometry": { "type": "Point", "coordinates": [ -71.8626, -32.6034, 26.032 ] } },
+{ "type": "Feature", "properties": { "mag": 4.5, "place": "81 km S of Severo-Kuril’sk, Russia", "time": "2026-07-15T01:05:37.270", "updated": "2026-07-15T01:33:36.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0iv", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.5 - 81 km S of Severo-Kuril’sk, Russia" }, "geometry": { "type": "Point", "coordinates": [ 155.9133, 49.9548, 66.6 ] } },
+{ "type": "Feature", "properties": { "mag": 2.8, "place": "103 km SE of False Pass, Alaska", "time": "2026-07-15T00:56:52.799", "updated": "2026-07-15T07:32:28.822", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwgedo", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 103 km SE of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -162.459, 54.11, 8.1 ] } },
+{ "type": "Feature", "properties": { "mag": 2.8, "place": "96 km S of Sand Point, Alaska", "time": "2026-07-15T00:54:45.585", "updated": "2026-07-15T07:30:19.761", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwgcht", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 96 km S of Sand Point, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -160.439, 54.473, 2.2 ] } },
+{ "type": "Feature", "properties": { "mag": 3.3, "place": "225 km ESE of Attu Station, Alaska", "time": "2026-07-15T00:44:57.101", "updated": "2026-07-15T07:28:28.922", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwftxy", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.3 - 225 km ESE of Attu Station, Alaska" }, "geometry": { "type": "Point", "coordinates": [ 176.127, 51.905, 20.0 ] } },
+{ "type": "Feature", "properties": { "mag": 3.2, "place": "52 km NW of San Antonio, Puerto Rico", "time": "2026-07-15T00:44:12.079", "updated": "2026-07-15T01:08:48.910", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71524353", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.2 - 52 km NW of San Antonio, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -67.433666666666696, 18.847, 21.57 ] } },
+{ "type": "Feature", "properties": { "mag": 5.1, "place": "South Sandwich Islands region", "time": "2026-07-15T00:35:28.891", "updated": "2026-07-15T00:53:31.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0ia", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 5.1 - South Sandwich Islands region" }, "geometry": { "type": "Point", "coordinates": [ -29.4723, -58.7712, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.8, "place": "101 km SE of False Pass, Alaska", "time": "2026-07-15T00:07:04.407", "updated": "2026-07-15T07:24:11.566", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nwemyk", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 101 km SE of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -162.455, 54.131, 7.3 ] } },
+{ "type": "Feature", "properties": { "mag": 4.1, "place": "57 km WSW of Puerto Madero, Mexico", "time": "2026-07-14T23:45:21.315", "updated": "2026-07-15T00:43:42.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0i4", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.1 - 57 km WSW of Puerto Madero, Mexico" }, "geometry": { "type": "Point", "coordinates": [ -92.9384, 14.6098, 45.368 ] } },
+{ "type": "Feature", "properties": { "mag": 3.17, "place": "60 km SE of Boca de Yuma, Dominican Republic", "time": "2026-07-14T22:51:17.779", "updated": "2026-07-14T23:08:32.030", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71524338", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.2 - 60 km SE of Boca de Yuma, Dominican Republic" }, "geometry": { "type": "Point", "coordinates": [ -68.197666666666706, 17.998, 20.18 ] } },
+{ "type": "Feature", "properties": { "mag": 5.5, "place": "Fiji region", "time": "2026-07-14T22:50:12.019", "updated": "2026-07-15T00:59:58.605", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0hk", "alert": "green", "felt": null, "tsunami": 0, "types": ",internal-moment-tensor,losspager,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 5.5 - Fiji region" }, "geometry": { "type": "Point", "coordinates": [ -178.5092, -20.748, 574.304 ] } },
+{ "type": "Feature", "properties": { "mag": 5.4, "place": "90 km SSE of False Pass, Alaska", "time": "2026-07-14T18:51:07.308", "updated": "2026-07-15T07:01:21.975", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0fu", "alert": "green", "felt": 7.0, "tsunami": 0, "types": ",dyfi,event-sequence,internal-moment-tensor,losspager,moment-tensor,oaf,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 5.4 - 90 km SSE of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -162.6381, 54.1759, 47.044 ] } },
+{ "type": "Feature", "properties": { "mag": 3.0, "place": "188 km SE of Chignik, Alaska", "time": "2026-07-14T17:30:31.467", "updated": "2026-07-14T18:53:47.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nvrhey", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.0 - 188 km SE of Chignik, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -156.462, 55.006, 10.6 ] } },
+{ "type": "Feature", "properties": { "mag": 3.12, "place": "65 km NNW of Charlotte Amalie, U.S. Virgin Islands", "time": "2026-07-14T16:45:30.880", "updated": "2026-07-14T17:47:04.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71524178", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.1 - 65 km NNW of Charlotte Amalie, U.S. Virgin Islands" }, "geometry": { "type": "Point", "coordinates": [ -65.105166666666705, 18.914, 47.83 ] } },
+{ "type": "Feature", "properties": { "mag": 4.3, "place": "94 km SE of False Pass, Alaska", "time": "2026-07-14T16:28:40.688", "updated": "2026-07-14T19:31:48.694", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0ej", "alert": "green", "felt": 2.0, "tsunami": 0, "types": ",dyfi,losspager,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 4.3 - 94 km SE of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -162.582, 54.1573, 44.015 ] } },
+{ "type": "Feature", "properties": { "mag": 2.9, "place": "12 km SSE of Dilley, Texas", "time": "2026-07-14T15:51:14.632", "updated": "2026-07-14T16:37:56.342", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/tx2026ntiklz", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 2.9 - 12 km SSE of Dilley, Texas" }, "geometry": { "type": "Point", "coordinates": [ -99.101, 28.572, 6.482 ] } },
+{ "type": "Feature", "properties": { "mag": 6.2, "place": "34 km WSW of Sarangani, Philippines", "time": "2026-07-14T15:49:41.602", "updated": "2026-07-15T07:15:00.827", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0d0", "alert": "green", "felt": 76.0, "tsunami": 0, "types": ",dyfi,ground-failure,internal-moment-tensor,internal-origin,losspager,moment-tensor,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 6.2 - 34 km WSW of Sarangani, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 125.1655, 5.3269, 67.854 ] } },
+{ "type": "Feature", "properties": { "mag": 4.0, "place": "41 km NNE of Las Terrenas, Dominican Republic", "time": "2026-07-14T15:20:14.296", "updated": "2026-07-14T17:41:52.930", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0cl", "alert": null, "felt": 16.0, "tsunami": 0, "types": ",dyfi,moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 4.0 - 41 km NNE of Las Terrenas, Dominican Republic" }, "geometry": { "type": "Point", "coordinates": [ -69.361, 19.6421, 16.554 ] } },
+{ "type": "Feature", "properties": { "mag": 4.0, "place": "43 km S of Ürümqi, China", "time": "2026-07-14T15:01:15.502", "updated": "2026-07-14T16:40:49.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0ce", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.0 - 43 km S of Ürümqi, China" }, "geometry": { "type": "Point", "coordinates": [ 87.6715, 43.4115, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 3.8, "place": "42 km S of Unalaska, Alaska", "time": "2026-07-14T14:56:44.832", "updated": "2026-07-14T18:41:16.369", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0cb", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 3.8 - 42 km S of Unalaska, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -166.4764, 53.4966, 81.501 ] } },
+{ "type": "Feature", "properties": { "mag": 3.46, "place": "1 km NW of Little America, Wyoming", "time": "2026-07-14T14:24:15.569", "updated": "2026-07-14T15:30:11.247", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/uu80145291", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 3.5 - 1 km NW of Little America, Wyoming" }, "geometry": { "type": "Point", "coordinates": [ -109.875, 41.5535, -2.85 ] } },
+{ "type": "Feature", "properties": { "mag": 2.81, "place": "75 km NNE of Cruz Bay, U.S. Virgin Islands", "time": "2026-07-14T13:45:07.460", "updated": "2026-07-14T14:23:01.590", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71524088", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 75 km NNE of Cruz Bay, U.S. Virgin Islands" }, "geometry": { "type": "Point", "coordinates": [ -64.411, 18.905166666666702, 17.96 ] } },
+{ "type": "Feature", "properties": { "mag": 5.1, "place": "3 km NNW of Sugal, Philippines", "time": "2026-07-14T13:15:08.009", "updated": "2026-07-14T17:27:43.936", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0bm", "alert": null, "felt": 11.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 5.1 - 3 km NNW of Sugal, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 125.4433, 5.69, 24.15 ] } },
+{ "type": "Feature", "properties": { "mag": 5.3, "place": "96 km SE of False Pass, Alaska", "time": "2026-07-14T12:12:19.529", "updated": "2026-07-15T00:22:31.688", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0b5", "alert": null, "felt": 6.0, "tsunami": 0, "types": ",dyfi,internal-moment-tensor,moment-tensor,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 5.3 - 96 km SE of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -162.543, 54.1456, 40.773 ] } },
+{ "type": "Feature", "properties": { "mag": 4.4, "place": "110 km E of Noda, Japan", "time": "2026-07-14T11:20:32.096", "updated": "2026-07-14T13:11:30.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0aw", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.4 - 110 km E of Noda, Japan" }, "geometry": { "type": "Point", "coordinates": [ 143.1121, 40.1659, 32.347 ] } },
+{ "type": "Feature", "properties": { "mag": 2.69, "place": "11 km ESE of Gilroy, CA", "time": "2026-07-14T11:11:56.190", "updated": "2026-07-15T03:48:51.053", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75395576", "alert": null, "felt": 2.0, "tsunami": 0, "types": ",dyfi,focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.7 - 11 km ESE of Gilroy, CA" }, "geometry": { "type": "Point", "coordinates": [ -121.451835632324006, 36.967498779296903, 3.48000001907349 ] } },
+{ "type": "Feature", "properties": { "mag": 4.0, "place": "209 km W of Port McNeill, Canada", "time": "2026-07-14T10:58:09.497", "updated": "2026-07-14T13:07:56.201", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0am", "alert": "green", "felt": null, "tsunami": 0, "types": ",losspager,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 4.0 - 209 km W of Port McNeill, Canada" }, "geometry": { "type": "Point", "coordinates": [ -130.0482, 50.7308, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.4, "place": "25 km SE of Tambolaka, Indonesia", "time": "2026-07-14T09:52:36.500", "updated": "2026-07-14T10:15:22.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0ag", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.4 - 25 km SE of Tambolaka, Indonesia" }, "geometry": { "type": "Point", "coordinates": [ 119.3992, -9.5899, 48.661 ] } },
+{ "type": "Feature", "properties": { "mag": 2.76, "place": "0 km ENE of Guánica, Puerto Rico", "time": "2026-07-14T08:59:14.039", "updated": "2026-07-15T06:32:13.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523978", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 0 km ENE of Guánica, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.904, 17.9731666666667, 12.94 ] } },
+{ "type": "Feature", "properties": { "mag": 5.6, "place": "11 km N of Pichigua, Peru", "time": "2026-07-14T08:21:06.499", "updated": "2026-07-15T08:31:41.963", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t0a3", "alert": "green", "felt": 1.0, "tsunami": 0, "types": ",dyfi,internal-moment-tensor,losspager,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 5.6 - 11 km N of Pichigua, Peru" }, "geometry": { "type": "Point", "coordinates": [ -71.4358, -14.5779, 140.088 ] } },
+{ "type": "Feature", "properties": { "mag": 4.9, "place": "50 km E of Noda, Japan", "time": "2026-07-14T08:07:30.198", "updated": "2026-07-14T11:29:35.723", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t09z", "alert": null, "felt": 2.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 4.9 - 50 km E of Noda, Japan" }, "geometry": { "type": "Point", "coordinates": [ 142.4075, 40.1657, 44.48 ] } },
+{ "type": "Feature", "properties": { "mag": 3.17, "place": "1 km S of Guánica, Puerto Rico", "time": "2026-07-14T07:55:56.970", "updated": "2026-07-15T06:25:30.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523953", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 3.2 - 1 km S of Guánica, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.907666666666699, 17.962, 13.64 ] } },
+{ "type": "Feature", "properties": { "mag": 3.8, "place": "80 km W of Akhiok, Alaska", "time": "2026-07-14T07:51:01.013", "updated": "2026-07-14T23:06:57.980", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nuxyrh", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,shakemap,", "type": "earthquake", "title": "M 3.8 - 80 km W of Akhiok, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -155.49, 56.984, 0.0 ] } },
+{ "type": "Feature", "properties": { "mag": 5.0, "place": "117 km E of Noda, Japan", "time": "2026-07-14T07:44:09.565", "updated": "2026-07-14T08:00:45.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t09u", "alert": null, "felt": null, "tsunami": 0, "types": ",internal-moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 5.0 - 117 km E of Noda, Japan" }, "geometry": { "type": "Point", "coordinates": [ 143.1932, 40.1338, 11.338 ] } },
+{ "type": "Feature", "properties": { "mag": 4.8, "place": "18 km WSW of Mabiton, Philippines", "time": "2026-07-14T07:18:47.993", "updated": "2026-07-14T08:27:35.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t09r", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.8 - 18 km WSW of Mabiton, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 123.0967, 12.7846, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 5.2, "place": "14 km WSW of Mabiton, Philippines", "time": "2026-07-14T07:04:54.275", "updated": "2026-07-14T14:13:46.828", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t09m", "alert": null, "felt": 7.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 5.2 - 14 km WSW of Mabiton, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 123.136, 12.7967, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.6, "place": "48 km NNE of Kon Tum, Vietnam", "time": "2026-07-14T06:48:05.687", "updated": "2026-07-14T09:18:42.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t09h", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.6 - 48 km NNE of Kon Tum, Vietnam" }, "geometry": { "type": "Point", "coordinates": [ 108.227, 14.7321, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.4, "place": "191 km N of Tobelo, Indonesia", "time": "2026-07-14T06:37:37.880", "updated": "2026-07-14T07:01:02.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t09g", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.4 - 191 km N of Tobelo, Indonesia" }, "geometry": { "type": "Point", "coordinates": [ 128.0077, 3.4609, 107.53 ] } },
+{ "type": "Feature", "properties": { "mag": 2.5, "place": "84 km SE of Akutan, Alaska", "time": "2026-07-14T06:24:53.216", "updated": "2026-07-14T23:48:14.901", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nuvbxp", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.5 - 84 km SE of Akutan, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -164.983, 53.533, 28.4 ] } },
+{ "type": "Feature", "properties": { "mag": 4.8, "place": "Mid-Indian Ridge", "time": "2026-07-14T06:15:06.358", "updated": "2026-07-14T06:33:33.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t097", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.8 - Mid-Indian Ridge" }, "geometry": { "type": "Point", "coordinates": [ 66.9107, -14.9372, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.59, "place": "2 km WSW of Indios, Puerto Rico", "time": "2026-07-14T06:06:57.640", "updated": "2026-07-14T11:13:15.700", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523938", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.6 - 2 km WSW of Indios, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.839833333333303, 17.985333333333301, 15.68 ] } },
+{ "type": "Feature", "properties": { "mag": 2.76, "place": "18 km WSW of Johannesburg, CA", "time": "2026-07-14T05:44:51.839", "updated": "2026-07-14T15:49:24.610", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/ci41293535", "alert": null, "felt": null, "tsunami": 0, "types": ",focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.8 - 18 km WSW of Johannesburg, CA" }, "geometry": { "type": "Point", "coordinates": [ -117.819166666667002, 35.309333333333299, 8.57 ] } },
+{ "type": "Feature", "properties": { "mag": 3.2, "place": "94 km SSW of Unalaska, Alaska", "time": "2026-07-14T04:35:52.118", "updated": "2026-07-14T23:32:15.884", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nurlli", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.2 - 94 km SSW of Unalaska, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -166.916, 53.053, 27.6 ] } },
+{ "type": "Feature", "properties": { "mag": 2.7, "place": "150 km S of False Pass, Alaska", "time": "2026-07-14T04:24:07.263", "updated": "2026-07-14T23:30:04.086", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nurbgt", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.7 - 150 km S of False Pass, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -163.637, 53.509, 6.5 ] } },
+{ "type": "Feature", "properties": { "mag": 2.7, "place": "272 km ESE of Attu Station, Alaska", "time": "2026-07-14T03:58:48.016", "updated": "2026-07-14T23:14:32.654", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nuqfbr", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.7 - 272 km ESE of Attu Station, Alaska" }, "geometry": { "type": "Point", "coordinates": [ 176.781, 51.777, 92.6 ] } },
+{ "type": "Feature", "properties": { "mag": 4.2, "place": "9 km ESE of Jurm, Afghanistan", "time": "2026-07-14T03:22:25.677", "updated": "2026-07-14T03:31:52.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t08m", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.2 - 9 km ESE of Jurm, Afghanistan" }, "geometry": { "type": "Point", "coordinates": [ 70.9297, 36.8385, 211.576 ] } },
+{ "type": "Feature", "properties": { "mag": 2.66, "place": "3 km WNW of Fuig, Puerto Rico", "time": "2026-07-14T02:57:15.920", "updated": "2026-07-14T10:20:20.130", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523888", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.7 - 3 km WNW of Fuig, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.9495, 17.997166666666701, 12.39 ] } },
+{ "type": "Feature", "properties": { "mag": 4.6, "place": "34 km SE of Sarangani, Philippines", "time": "2026-07-14T01:38:24.645", "updated": "2026-07-14T01:53:42.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t085", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.6 - 34 km SE of Sarangani, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 125.6791, 5.1842, 66.185 ] } },
+{ "type": "Feature", "properties": { "mag": 4.9, "place": "southeast of the Loyalty Islands", "time": "2026-07-14T01:27:30.486", "updated": "2026-07-14T02:06:56.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t083", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.9 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.4439, -22.7425, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 5.0, "place": "2 km WSW of Congregación Reforma, Mexico", "time": "2026-07-14T01:19:59.535", "updated": "2026-07-14T05:45:33.664", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t07s", "alert": null, "felt": 9.0, "tsunami": 0, "types": ",dyfi,internal-moment-tensor,moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 5.0 - 2 km WSW of Congregación Reforma, Mexico" }, "geometry": { "type": "Point", "coordinates": [ -92.3316, 14.7717, 80.448 ] } },
+{ "type": "Feature", "properties": { "mag": 2.8, "place": "222 km SE of Chiniak, Alaska", "time": "2026-07-14T01:17:01.505", "updated": "2026-07-14T23:03:28.817", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nukruw", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.8 - 222 km SE of Chiniak, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -149.225, 56.509, 20.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.52, "place": "15 km SE of Fern Forest, Hawaii", "time": "2026-07-14T01:07:50.750", "updated": "2026-07-14T18:27:46.469", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/hv75002021", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 2.5 - 15 km SE of Fern Forest, Hawaii" }, "geometry": { "type": "Point", "coordinates": [ -155.043666666667008, 19.3563333333333, 7.53 ] } },
+{ "type": "Feature", "properties": { "mag": 4.6, "place": "6 km NW of San Rafael, Philippines", "time": "2026-07-14T01:03:15.881", "updated": "2026-07-14T07:27:26.124", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t07r", "alert": null, "felt": 0.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 4.6 - 6 km NW of San Rafael, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 122.9157, 13.1309, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.7, "place": "25 km N of Fishhook, Alaska", "time": "2026-07-13T23:08:20.930", "updated": "2026-07-13T23:51:29.129", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026nugnky", "alert": null, "felt": 2.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 2.7 - 25 km N of Fishhook, Alaska" }, "geometry": { "type": "Point", "coordinates": [ -149.178, 61.972, 29.2 ] } },
+{ "type": "Feature", "properties": { "mag": 4.4, "place": "Greenland Sea", "time": "2026-07-13T22:00:50.418", "updated": "2026-07-13T23:36:47.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t06z", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.4 - Greenland Sea" }, "geometry": { "type": "Point", "coordinates": [ 7.8819, 73.7141, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.69, "place": "4 km S of Guánica, Puerto Rico", "time": "2026-07-13T21:38:23.849", "updated": "2026-07-14T09:39:30.170", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523833", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 2.7 - 4 km S of Guánica, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.915166666666707, 17.928833333333301, 14.48 ] } },
+{ "type": "Feature", "properties": { "mag": 4.3, "place": "Greenland Sea", "time": "2026-07-13T21:30:18.010", "updated": "2026-07-13T23:05:14.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t06l", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.3 - Greenland Sea" }, "geometry": { "type": "Point", "coordinates": [ 8.2919, 73.6953, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.5, "place": "145 km NNE of Sorong, Indonesia", "time": "2026-07-13T21:06:07.519", "updated": "2026-07-13T22:40:52.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t06f", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.5 - 145 km NNE of Sorong, Indonesia" }, "geometry": { "type": "Point", "coordinates": [ 131.6675, 0.3702, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 5.0, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T21:03:37.177", "updated": "2026-07-13T21:21:26.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t06d", "alert": null, "felt": null, "tsunami": 0, "types": ",internal-moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 5.0 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5098, -22.9464, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.8, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T19:48:32.875", "updated": "2026-07-13T20:10:01.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t05y", "alert": null, "felt": null, "tsunami": 0, "types": ",internal-moment-tensor,origin,phase-data,", "type": "earthquake", "title": "M 4.8 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5441, -23.0777, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 3.7, "place": "Rat Islands, Aleutian Islands, Alaska", "time": "2026-07-13T19:01:02.766", "updated": "2026-07-14T07:19:44.900", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/aka2026ntydlg", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,shakemap,", "type": "earthquake", "title": "M 3.7 - Rat Islands, Aleutian Islands, Alaska" }, "geometry": { "type": "Point", "coordinates": [ 177.703, 50.373, 172.3 ] } },
+{ "type": "Feature", "properties": { "mag": 2.8, "place": "22 km NW of Petrolia, CA", "time": "2026-07-13T18:44:28.259", "updated": "2026-07-14T08:35:45.102", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75395151", "alert": null, "felt": 1.0, "tsunami": 0, "types": ",dyfi,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.8 - 22 km NW of Petrolia, CA" }, "geometry": { "type": "Point", "coordinates": [ -124.480331420897997, 40.4591674804688, 18.600000381469702 ] } },
+{ "type": "Feature", "properties": { "mag": 2.58, "place": "18 km WSW of Johannesburg, CA", "time": "2026-07-13T18:29:13.589", "updated": "2026-07-13T20:21:24.161", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/ci41292855", "alert": null, "felt": 2.0, "tsunami": 0, "types": ",dyfi,focal-mechanism,nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.6 - 18 km WSW of Johannesburg, CA" }, "geometry": { "type": "Point", "coordinates": [ -117.807333333333005, 35.2945, 7.77 ] } },
+{ "type": "Feature", "properties": { "mag": 4.0, "place": "215 km WNW of Anamizu, Japan", "time": "2026-07-13T17:58:26.654", "updated": "2026-07-13T18:57:25.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t04s", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.0 - 215 km WNW of Anamizu, Japan" }, "geometry": { "type": "Point", "coordinates": [ 134.5791, 37.8376, 412.725 ] } },
+{ "type": "Feature", "properties": { "mag": 4.9, "place": "South Sandwich Islands region", "time": "2026-07-13T17:45:19.903", "updated": "2026-07-13T18:05:02.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t04b", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.9 - South Sandwich Islands region" }, "geometry": { "type": "Point", "coordinates": [ -25.0342, -58.601, 35.0 ] } },
+{ "type": "Feature", "properties": { "mag": 5.0, "place": "5 km SE of Butulan, Philippines", "time": "2026-07-13T17:44:29.061", "updated": "2026-07-13T17:59:21.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t048", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 5.0 - 5 km SE of Butulan, Philippines" }, "geometry": { "type": "Point", "coordinates": [ 125.4626, 5.577, 20.408 ] } },
+{ "type": "Feature", "properties": { "mag": 4.5, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T17:24:11.391", "updated": "2026-07-13T17:47:45.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t044", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.5 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5971, -22.8062, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.7, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T17:20:59.815", "updated": "2026-07-13T17:37:54.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t042", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.7 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5924, -22.8424, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.5, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T17:15:34.252", "updated": "2026-07-13T17:43:19.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t046", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.5 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5259, -22.8403, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.3176267788868703, "place": "18 km WSW of Johannesburg, CA", "time": "2026-07-13T16:40:55.170", "updated": "2026-07-14T22:29:47.391", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/ci41292687", "alert": "green", "felt": 1087.0, "tsunami": 0, "types": ",dyfi,event-sequence,focal-mechanism,losspager,moment-tensor,nearby-cities,oaf,origin,phase-data,scitech-link,shake-alert,shakemap,", "type": "earthquake", "title": "M 4.3 - 18 km WSW of Johannesburg, CA" }, "geometry": { "type": "Point", "coordinates": [ -117.814833333332999, 35.312166666666698, 7.55 ] } },
+{ "type": "Feature", "properties": { "mag": 5.1, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T16:31:30.321", "updated": "2026-07-13T17:28:04.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t02f", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 5.1 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.3991, -22.8289, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.7, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T15:14:34.815", "updated": "2026-07-13T16:20:38.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t01w", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.7 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5407, -22.8636, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 6.3, "place": "southeast of the Loyalty Islands", "time": "2026-07-13T14:45:49.203", "updated": "2026-07-14T14:57:07.243", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t01n", "alert": "green", "felt": null, "tsunami": 0, "types": ",ground-failure,internal-moment-tensor,internal-origin,losspager,moment-tensor,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 6.3 - southeast of the Loyalty Islands" }, "geometry": { "type": "Point", "coordinates": [ 171.5199, -22.7889, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.2, "place": "35 km S of Kazarman, Kyrgyzstan", "time": "2026-07-13T14:43:00.760", "updated": "2026-07-13T18:46:44.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t01l", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.2 - 35 km S of Kazarman, Kyrgyzstan" }, "geometry": { "type": "Point", "coordinates": [ 73.9665, 41.0854, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.51, "place": "0 km E of Guánica, Puerto Rico", "time": "2026-07-13T13:31:16.009", "updated": "2026-07-13T14:28:36.130", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523713", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.5 - 0 km E of Guánica, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.9005, 17.9725, 13.73 ] } },
+{ "type": "Feature", "properties": { "mag": 4.8, "place": "south of the Fiji Islands", "time": "2026-07-13T12:19:58.505", "updated": "2026-07-13T13:06:54.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000t014", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.8 - south of the Fiji Islands" }, "geometry": { "type": "Point", "coordinates": [ -176.3145, -24.1915, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 2.53, "place": "31 km WSW of Petrolia, CA", "time": "2026-07-13T10:53:39.799", "updated": "2026-07-13T11:22:19.635", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nc75394876", "alert": null, "felt": null, "tsunami": 0, "types": ",nearby-cities,origin,phase-data,scitech-link,", "type": "earthquake", "title": "M 2.5 - 31 km WSW of Petrolia, CA" }, "geometry": { "type": "Point", "coordinates": [ -124.603332519530994, 40.181331634521499, 1.0900000333786 ] } },
+{ "type": "Feature", "properties": { "mag": 3.2, "place": "41 km NW of Toyah, Texas", "time": "2026-07-13T10:16:23.042", "updated": "2026-07-13T14:35:46.134", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/tx2026nrbozw", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 3.2 - 41 km NW of Toyah, Texas" }, "geometry": { "type": "Point", "coordinates": [ -104.135, 31.544, 9.3683 ] } },
+{ "type": "Feature", "properties": { "mag": 2.97, "place": "20 km ESE of Silver Springs, Nevada", "time": "2026-07-13T09:46:03.724", "updated": "2026-07-14T05:50:11.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/nn00921593", "alert": null, "felt": 3.0, "tsunami": 0, "types": ",dyfi,origin,phase-data,", "type": "earthquake", "title": "M 3.0 - 20 km ESE of Silver Springs, Nevada" }, "geometry": { "type": "Point", "coordinates": [ -119.0017, 39.3475, 6.8656 ] } },
+{ "type": "Feature", "properties": { "mag": 2.7, "place": "36 km SSE of Guánica, Puerto Rico", "time": "2026-07-13T09:02:52.490", "updated": "2026-07-14T05:36:52.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/pr71523658", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 2.7 - 36 km SSE of Guánica, Puerto Rico" }, "geometry": { "type": "Point", "coordinates": [ -66.789833333333306, 17.665333333333301, 14.89 ] } },
+{ "type": "Feature", "properties": { "mag": 6.4, "place": "191 km SE of Lorengau, Papua New Guinea", "time": "2026-07-13T08:53:27.913", "updated": "2026-07-14T10:00:55.147", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000szzy", "alert": "green", "felt": null, "tsunami": 0, "types": ",ground-failure,internal-moment-tensor,internal-origin,losspager,moment-tensor,origin,phase-data,shakemap,", "type": "earthquake", "title": "M 6.4 - 191 km SE of Lorengau, Papua New Guinea" }, "geometry": { "type": "Point", "coordinates": [ 148.5218, -3.2207, 10.0 ] } },
+{ "type": "Feature", "properties": { "mag": 4.3, "place": "182 km E of Petropavlovsk-Kamchatsky, Russia", "time": "2026-07-13T08:37:08.571", "updated": "2026-07-13T11:17:37.040", "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us7000szzx", "alert": null, "felt": null, "tsunami": 0, "types": ",origin,phase-data,", "type": "earthquake", "title": "M 4.3 - 182 km E of Petropavlovsk-Kamchatsky, Russia" }, "geometry": { "type": "Point", "coordinates": [ 161.3066, 52.7796, 10.0 ] } }
+]
+}
+`,
+
+},
+  },
+  document.getElementById("root")
+)
+
+    </script>
+  </body>
+  <!-- Generated from Stlite Sharing (https://edit.share.stlite.net/), and the source version is d6cad53331d6cebd288bbd7993f03b158f6ac1ab -->
+</html>
