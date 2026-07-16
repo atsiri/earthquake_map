@@ -1,19 +1,16 @@
 import streamlit as st
 import pandas as pd
-import folium
 import json
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
+import plotly.graph_objects as go
 
 # Set page configuration
 st.set_page_config(layout="wide", page_title="Earthquake Monitoring Dashboard")
 
 # -----------------------------------------------------------------------------
-# 1. DATA LOADING FUNCTION
+# 1. FAST DATA LOADING (Vectorized)
 # -----------------------------------------------------------------------------
 @st.cache_data
 def load_data(filepath="data.geojson"):
-    # Load data from the local GeoJSON file
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             geo_data = json.load(f)
@@ -22,31 +19,24 @@ def load_data(filepath="data.geojson"):
         return pd.DataFrame()
 
     table_rows = []
-    # Parse the standard GeoJSON FeatureCollection structure
+    
+    # Helper to clean numeric values quickly
+    def clean_num(val):
+        if val == '-' or val is None: return 0
+        try: return int(float(val))
+        except: return 0
+
     for feature in geo_data.get('features', []):
         props = feature.get('properties', {})
         coords = feature.get('geometry', {}).get('coordinates', [0, 0, 0])
         
-        # GeoJSON coordinates are formatted as: [longitude, latitude, depth]
-        lon, lat, depth = coords[0], coords[1], coords[2]
-        
-        # Helper function to convert victims data into clean integers
-        def clean_num(val):
-            try:
-                if val == '-' or val is None:
-                    return 0
-                return int(float(val))
-            except:
-                return 0
-        
         table_rows.append({
             'Magnitude': props.get('mag'),
             'Place': props.get('place'),
-            'Depth (km)': depth,
-            # The GeoJSON time is an ISO string, so we let pandas infer the datetime format
-            'Date': pd.to_datetime(props.get('time')).date(),
-            'Latitude': lat,
-            'Longitude': lon,
+            'Depth (km)': coords[2],
+            'time_str': props.get('time'),  # Keep as string for fast vectorized parsing
+            'Latitude': coords[1],
+            'Longitude': coords[0],
             'Country': props.get('country'),
             'tsunami': props.get('tsunami'),
             'mmi': props.get('mmi'),
@@ -56,7 +46,14 @@ def load_data(filepath="data.geojson"):
             'impact': props.get('impact')
         })
         
-    return pd.DataFrame(table_rows)
+    df = pd.DataFrame(table_rows)
+    
+    if not df.empty:
+        # Fast vectorized date conversion
+        df['Date'] = pd.to_datetime(df['time_str'], format='ISO8601', errors='coerce').dt.date
+        df = df.drop(columns=['time_str'])
+        
+    return df
 
 df_raw = load_data()
 
@@ -69,114 +66,91 @@ if df_raw.empty:
 # -----------------------------------------------------------------------------
 st.sidebar.title("Filters")
 
-# --- Filter 1: Magnitude ---
-min_mag = float(df_raw['Magnitude'].min())
-max_mag = float(df_raw['Magnitude'].max())
-mag_range = st.sidebar.slider(
-    "Select Magnitude Range", 
-    min_value=min_mag, 
-    max_value=max_mag, 
-    value=(min_mag, max_mag), 
-    step=0.1
-)
+# Magnitude Filter
+min_mag, max_mag = float(df_raw['Magnitude'].min()), float(df_raw['Magnitude'].max())
+mag_range = st.sidebar.slider("Select Magnitude Range", min_mag, max_mag, (min_mag, max_mag), 0.1)
 
-# --- Filter 2: Date Range ---
-min_date = df_raw['Date'].min()
-max_date = df_raw['Date'].max()
-date_range = st.sidebar.date_input(
-    "Select Date Range", 
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date
-)
+# Date Filter
+min_date, max_date = df_raw['Date'].min(), df_raw['Date'].max()
+date_range = st.sidebar.date_input("Select Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
 
-# --- Filter 3: Search Location ---
+# Location Filter
 search_location = st.sidebar.text_input("Search Location / Country Name", "").strip()
 
-# --- Filter 3b: Country Filter (Multiple Selections) ---
+# Country Filter
 unique_countries = sorted(df_raw['Country'].dropna().unique())
 selected_countries = st.sidebar.multiselect("Select Countries", options=unique_countries, default=[])
 
-# --- Filter 4: Show M6.0+ Scatter Points ---
-show_m6_scatter = st.sidebar.checkbox("Show M ≥ 6.0 Earthquake Points", value=True)
-
-# --- Filter 5: Show Tectonic Plates ---
+# Layer Toggles
+show_m7_scatter = st.sidebar.checkbox("Show M ≥ 7.0 Earthquake Points", value=True)
 show_plates = st.sidebar.checkbox("Show Tectonic Plates", value=False)
 
 # -----------------------------------------------------------------------------
-# 3. APPLY FILTERS TO DATAFRAME
+# 3. APPLY FILTERS
 # -----------------------------------------------------------------------------
-# Apply Magnitude filter
-df_filtered = df_raw[
-    (df_raw['Magnitude'] >= mag_range[0]) & 
-    (df_raw['Magnitude'] <= mag_range[1])
-]
+df_filtered = df_raw[(df_raw['Magnitude'] >= mag_range[0]) & (df_raw['Magnitude'] <= mag_range[1])]
 
-# Apply Date filter (handles case where user selects a single date vs a range)
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    df_filtered = df_filtered[
-        (df_filtered['Date'] >= date_range[0]) & 
-        (df_filtered['Date'] <= date_range[1])
-    ]
-elif isinstance(date_range, tuple) and len(date_range) == 1:
-    df_filtered = df_filtered[df_filtered['Date'] == date_range[0]]
+if isinstance(date_range, tuple):
+    if len(date_range) == 2:
+        df_filtered = df_filtered[(df_filtered['Date'] >= date_range[0]) & (df_filtered['Date'] <= date_range[1])]
+    elif len(date_range) == 1:
+        df_filtered = df_filtered[df_filtered['Date'] == date_range[0]]
 
-# Apply Location filter
 if search_location:
     df_filtered = df_filtered[df_filtered['Place'].str.contains(search_location, case=False, na=False)]
 
-# Apply Country filter
 if selected_countries:
     df_filtered = df_filtered[df_filtered['Country'].isin(selected_countries)]
 
 # -----------------------------------------------------------------------------
-# 4. MAIN LAYOUT & RENDERING
+# 4. DASHBOARD LAYOUT & METRICS
 # -----------------------------------------------------------------------------
 st.title("Earthquake Hazard Density Analysis")
 
-# High-level metrics row
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Events Displayed", len(df_filtered))
-if not df_filtered.empty:
-    col2.metric("Max Magnitude", f"{df_filtered['Magnitude'].max():.1f}")
-    col3.metric("Avg Depth", f"{df_filtered['Depth (km)'].mean():.1f} km")
-else:
-    col2.metric("Max Magnitude", "N/A")
-    col3.metric("Avg Depth", "N/A")
+# Calculate totals for the metrics
+total_events = len(df_filtered)
+total_tsunami = int(pd.to_numeric(df_filtered['tsunami'], errors='coerce').fillna(0).sum())
+total_dead = int(df_filtered['dead'].sum())
+total_injured = int(df_filtered['injured'].sum())
+
+# Display metrics in two rows
+row1 = st.columns(6)
+row1[0].metric("Total Events", total_events)
+row1[1].metric("Max Magnitude", f"{df_filtered['Magnitude'].max():.1f}" if not df_filtered.empty else "N/A")
+row1[2].metric("Avg Depth", f"{df_filtered['Depth (km)'].mean():.1f} km" if not df_filtered.empty else "N/A")
+row1[3].metric("Total Tsunami Occurrences", total_tsunami)
+row1[4].metric("Total Deaths", total_dead)
+row1[5].metric("Total Injured", total_injured)
 
 st.markdown("---")
 
+# -----------------------------------------------------------------------------
+# 5. PLOTLY MAP RENDERING
+# -----------------------------------------------------------------------------
 if not df_filtered.empty:
     st.subheader("Global Seismic Density Map")
     
-    # 1. Initialize Folium Map
-    m = folium.Map(location=[0, 120], zoom_start=2, tiles='CartoDB positron')
-    
-    # 2. Extract [latitude, longitude] pairs and add the HeatMap layer
-    heat_data = df_filtered[['Latitude', 'Longitude']].values.tolist()
-    
-    transparent_gradient = {
-        0.2: 'rgba(0, 0, 255, 0.4)',
-        0.4: 'rgba(0, 255, 255, 0.5)',
-        0.6: 'rgba(0, 255, 0, 0.6)',
-        0.8: 'rgba(255, 255, 0, 0.7)',
-        1.0: 'rgba(255, 0, 0, 0.8)'
-    }
-    
-    HeatMap(
-        heat_data, 
-        radius=15, 
-        blur=10, 
-        max_zoom=1,
-        min_opacity=0.1,
-        gradient=transparent_gradient
-    ).add_to(m)
+    fig = go.Figure()
 
-    # 3. SPATIAL AGGREGATION FOR HOVER TOOLTIPS
+    # --- Layer 1: Density / Heatmap ---
+    # Plotly's Densitymapbox uses a Z value to weight the heatmap. 
+    # We pass 1s to replicate a pure density map, or use magnitude for weighted intensity.
+    fig.add_trace(go.Densitymapbox(
+        lat=df_filtered['Latitude'],
+        lon=df_filtered['Longitude'],
+        z=[1] * len(df_filtered), 
+        radius=15,
+        colorscale=[[0, 'rgba(0,0,255,0)'], [0.5, 'blue'], [0.6, 'cyan'], [0.7, 'green'], [0.8, 'yellow'], [0.9, 'orange'], [1.0, 'red']],
+        opacity=0.3,
+        showscale=False,
+        hoverinfo='skip',
+        name='Density'
+    ))
+
+    # --- Layer 2: Aggregated Area Hover (Invisible Markers) ---
     df_agg = df_filtered.copy()
     df_agg['Lat_Bin'] = df_agg['Latitude'].round(0)
     df_agg['Lon_Bin'] = df_agg['Longitude'].round(0)
-    
     df_agg = df_agg.sort_values('Magnitude', ascending=False)
     
     grouped = df_agg.groupby(['Lat_Bin', 'Lon_Bin']).agg(
@@ -190,106 +164,174 @@ if not df_filtered.empty:
         Total_Injured=('injured', 'sum')
     ).reset_index()
 
-    # 4. Overlay invisible interactive markers for general area hover info
-    for _, row in grouped.iterrows():
-        tooltip_html = f"""
-        <div style="font-family: sans-serif; font-size: 14px; min-width: 200px;">
-            <b>Area:</b> {row['Area_Details']}<br>
-            <b>Earthquakes in Area:</b> {row['Num_Earthquakes']}<br>
-            <b>Highest Magnitude:</b> M {row['Max_Mag']} (on {row['Max_Mag_Date']})<br>
-            <b>Total Dead (Area):</b> {row['Total_Dead']}<br>
-            <b>Total Injured (Area):</b> {row['Total_Injured']}
-        </div>
-        """
-        
-        folium.CircleMarker(
-            location=[row['Lat_Center'], row['Lon_Center']],
-            radius=18,                  
-            color='rgba(0,0,0,0)',      
-            fill=True,
-            fill_color='rgba(0,0,0,0)', 
-            tooltip=tooltip_html
-        ).add_to(m)
+    hover_texts = [
+        f"<b>Area:</b> {row['Area_Details']}<br>"
+        f"<b>Earthquakes in Area:</b> {row['Num_Earthquakes']}<br>"
+        f"<b>Highest Magnitude:</b> M {row['Max_Mag']} (on {row['Max_Mag_Date']})<br>"
+        f"<b>Total Dead:</b> {row['Total_Dead']}<br>"
+        f"<b>Total Injured:</b> {row['Total_Injured']}"
+        for _, row in grouped.iterrows()
+    ]
 
-    # 5. Overlay specific scatter points for M >= 6.0 earthquakes if checked
-    if show_m6_scatter:
-        df_m6_plus = df_filtered[df_filtered['Magnitude'] >= 6.0]
-        
-        if not df_m6_plus.empty:
-            max_m6_mag = df_m6_plus['Magnitude'].max()
-            
-            for _, row in df_m6_plus.iterrows():
-                mag = row['Magnitude']
-                
-                # Calculate color dynamically: Yellow (6.0) to Red (Max Magnitude)
-                if max_m6_mag > 6.0:
-                    ratio = (mag - 6.0) / (max_m6_mag - 6.0)
-                else:
-                    ratio = 1.0  # Default to red if all points are exactly 6.0
-                
-                # Green channel scales from 255 (Yellow) to 0 (Red)
-                g_val = int(255 * (1 - ratio))
-                color_hex = f'#ff{g_val:02x}00'
-                
-                m6_tooltip_html = f"""
-                <div style="font-family: sans-serif; font-size: 14px; min-width: 220px; color: #333;">
-                    <h4 style="margin-top: 0; color: {color_hex}; text-shadow: 1px 1px 1px #000;">⚠️ Major Earthquake</h4>
-                    <b>Magnitude:</b> {mag}<br>
-                    <b>Location:</b> {row['Place']}<br>
-                    <b>Date:</b> {row['Date']}<br>
-                    <b>Depth:</b> {row['Depth (km)']} km<br>
-                    <b>Coords:</b> {row['Latitude']:.4f}, {row['Longitude']:.4f}<br>
-                    <b>Dead:</b> {row['dead']}<br>
-                    <b>Injured:</b> {row['injured']}
-                </div>
-                """
-                
-                folium.CircleMarker(
-                    location=[row['Latitude'], row['Longitude']],
-                    radius=2,
-                    color='black',
-                    weight=1,
-                    fill=True,
-                    fill_color=color_hex,
-                    fill_opacity=0.9,
-                    tooltip=m6_tooltip_html
-                ).add_to(m)
+    fig.add_trace(go.Scattermapbox(
+        lat=grouped['Lat_Center'],
+        lon=grouped['Lon_Center'],
+        mode='markers',
+        marker=dict(size=20, opacity=0), # Invisible trigger area
+        text=hover_texts,
+        hoverinfo='text',
+        name='Area Summary'
+    ))
 
-    # 6. Overlay Tectonic Plates if checked
+    # --- Layer 3: m7.0+ Scatter Points ---
+    if show_m7_scatter:
+        df_m7 = df_filtered[df_filtered['Magnitude'] >= 7.0]
+        if not df_m7.empty:
+            m7_hover_texts = [
+                f"<b>⚠️ Major Earthquake</b><br>"
+                f"<b>Magnitude:</b> {row['Magnitude']}<br>"
+                f"<b>Location:</b> {row['Place']}<br>"
+                f"<b>Date:</b> {row['Date']}<br>"
+                f"<b>Depth:</b> {row['Depth (km)']} km<br>"
+                f"<b>Coords:</b> {row['Latitude']:.4f}, {row['Longitude']:.4f}<br>"
+                f"<b>Dead:</b> {row['dead']}<br>"
+                f"<b>Injured:</b> {row['injured']}"
+                for _, row in df_m7.iterrows()
+            ]
+
+            fig.add_trace(go.Scattermapbox(
+                lat=df_m7['Latitude'],
+                lon=df_m7['Longitude'],
+                mode='markers',
+                marker=dict(
+                    size=8,
+                    color=df_m7['Magnitude'],
+                    colorscale=[[0, "#ff7b00"], [1, "#aa0000"]], # Yellow to Red
+                    cmin=7.0,
+                    cmax=df_filtered['Magnitude'].max() if df_filtered['Magnitude'].max() > 7.0 else 7.1,
+                    showscale=True,
+                    colorbar=dict(title="Mag ≥ 7.0", x=0.95)
+                ),
+                text=m7_hover_texts,
+                hoverinfo='text',
+                name='M ≥ 7.0'
+            ))
+
+    # --- Layer 4: Tectonic Plates ---
+    # Plotly requires extracting LineString coordinates to map them seamlessly with hoverdata
     if show_plates:
         try:
             with open("plates.geojson", "r", encoding="utf-8") as f:
                 plates_data = json.load(f)
             
-            folium.GeoJson(
-                plates_data,
-                name="Tectonic Plates",
-                style_function=lambda feature: {
-                    'color': '#2C3E50',
-                    'weight': 2.5,
-                    'opacity': 0.8,
-                    'dashArray': '5, 5'
-                },
-                tooltip=folium.GeoJsonTooltip(
-                    fields=['plate1', 'plate2', 'type', 'feature', 'length'],
-                    aliases=['Plate 1:', 'Plate 2:', 'Boundary Type:', 'Feature Name:', 'Length:'],
-                    localize=True,
-                    style=("background-color: white; color: #333333; font-family: arial; font-size: 13px; padding: 10px;")
+            p_lats, p_lons, p_texts = [], [], []
+            
+            for feature in plates_data.get('features', []):
+                geom_type = feature['geometry']['type']
+                coords = feature['geometry']['coordinates']
+                props = feature['properties']
+                
+                hover_str = (
+                    f"<b>Plate 1:</b> {props.get('plate1', 'N/A')}<br>"
+                    f"<b>Plate 2:</b> {props.get('plate2', 'N/A')}<br>"
+                    f"<b>Boundary Type:</b> {props.get('type', 'N/A')}<br>"
+                    f"<b>Feature Name:</b> {props.get('feature', 'N/A')}<br>"
+                    f"<b>Length:</b> {props.get('length', 'N/A')}"
                 )
-            ).add_to(m)
+                
+                # Flatten the coordinates and insert Nones to break lines
+                if geom_type == 'LineString':
+                    for lon, lat in coords:
+                        p_lons.append(lon); p_lats.append(lat); p_texts.append(hover_str)
+                    p_lons.append(None); p_lats.append(None); p_texts.append(None)
+                elif geom_type == 'MultiLineString':
+                    for line in coords:
+                        for lon, lat in line:
+                            p_lons.append(lon); p_lats.append(lat); p_texts.append(hover_str)
+                        p_lons.append(None); p_lats.append(None); p_texts.append(None)
+            
+            fig.add_trace(go.Scattermapbox(
+                lat=p_lats,
+                lon=p_lons,
+                mode='lines',
+                line=dict(width=1, color="#5D4B3B"),
+                opacity=0.3,
+                text=p_texts,
+                hoverinfo='text',
+                name='Tectonic Plates'
+            ))
         except Exception as e:
             st.error(f"Error loading plates.geojson: {e}")
-    
-    # 7. Render map back into Streamlit canvas
-    st_folium(m, width=1400, height=500, returned_objects=[])
+
+    # --- Configure Map Layout ---
+    fig.update_layout(
+        autosize=True,
+        mapbox=dict(
+            style='carto-positron',
+            center=dict(lat=0, lon=120),
+            zoom=1.5
+        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=650,
+        showlegend=False
+    )
+
+    # Render Plotly Chart in Streamlit
+    #st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch', config={'scrollZoom': True})
     
     st.markdown("---")
     
+    # st.subheader("Data Details")
+    # st.dataframe(
+    #     df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'tsunami', 'mmi', 'mmi_level', 'dead', 'injured', 'impact']]\
+    #         .rename(columns={'tsunami':'Tsunami', 'mmi':'MMI', 'mmi_level':'Level', 'dead':'Dead', 'injured':'Injured', 'impact':'Impact'}), 
+    #     width='stretch', 
+    #     hide_index=True
+    # )
+    
     st.subheader("Data Details")
+    
+    # 1. Create a copy of the specific columns you want to display
+    df_display = df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'tsunami', 'mmi', 'mmi_level', 'dead', 'injured', 'impact']].copy()\
+        .rename(columns={'tsunami':'Tsunami', 'mmi':'MMI', 'mmi_level':'Level', 'dead':'Dead', 'injured':'Injured', 'impact':'Impact'})
+    
     st.dataframe(
-        df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'tsunami', 'mmi', 'mmi_level', 'dead', 'injured', 'impact']], 
-        use_container_width=True, 
+        df_display, 
+        width='stretch', 
         hide_index=True
     )
+    
+    # # 2. Calculate the totals
+    # total_eq = len(df_filtered)
+    # # Safely convert tsunami to numeric in case it contains None or strings, then sum
+    # total_tsunami = pd.to_numeric(df_filtered['tsunami'], errors='coerce').fillna(0).sum()
+    # total_dead = df_filtered['dead'].sum()
+    # total_injured = df_filtered['injured'].sum()
+    
+    # # 3. Create a summary row mapping the totals to the correct columns
+    # summary_row = pd.DataFrame([{
+    #     'Magnitude': None, 
+    #     'Place': f"TOTAL ({total_eq} earthquakes)", 
+    #     'Depth (km)': None, 
+    #     'Date': None, 
+    #     'Tsunami': int(total_tsunami), 
+    #     'MMI': None, 
+    #     'Level': None, 
+    #     'Dead': int(total_dead), 
+    #     'Injured': int(total_injured), 
+    #     'Impact': None
+    # }])
+    
+    # # 4. Append the summary row to the bottom of the display dataframe
+    # df_display = pd.concat([df_display, summary_row], ignore_index=True)
+    
+    # st.markdown("**(Summary)**")
+    # st.dataframe(
+    #     summary_row, 
+    #     width='stretch', 
+    #     hide_index=True,
+    #     hide_header
+    # )
 else:
     st.info("No earthquake records match the selected sidebar filters. Try expanding your search bounds.")
