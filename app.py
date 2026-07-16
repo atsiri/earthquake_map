@@ -30,6 +30,15 @@ def load_data(filepath="data.geojson"):
         # GeoJSON coordinates are formatted as: [longitude, latitude, depth]
         lon, lat, depth = coords[0], coords[1], coords[2]
         
+        # Helper function to convert victims data into clean integers
+        def clean_num(val):
+            try:
+                if val == '-' or val is None:
+                    return 0
+                return int(float(val))
+            except:
+                return 0
+        
         table_rows.append({
             'Magnitude': props.get('mag'),
             'Place': props.get('place'),
@@ -37,7 +46,14 @@ def load_data(filepath="data.geojson"):
             # The GeoJSON time is an ISO string, so we let pandas infer the datetime format
             'Date': pd.to_datetime(props.get('time')).date(),
             'Latitude': lat,
-            'Longitude': lon
+            'Longitude': lon,
+            'Country': props.get('country'),
+            'tsunami': props.get('tsunami'),
+            'mmi': props.get('mmi'),
+            'mmi_level': props.get('mmi_level'),
+            'dead': clean_num(props.get('dead')),
+            'injured': clean_num(props.get('injured')),
+            'impact': props.get('impact')
         })
         
     return pd.DataFrame(table_rows)
@@ -77,8 +93,15 @@ date_range = st.sidebar.date_input(
 # --- Filter 3: Search Location ---
 search_location = st.sidebar.text_input("Search Location / Country Name", "").strip()
 
+# --- Filter 3b: Country Filter (Multiple Selections) ---
+unique_countries = sorted(df_raw['Country'].dropna().unique())
+selected_countries = st.sidebar.multiselect("Select Countries", options=unique_countries, default=[])
+
 # --- Filter 4: Show M6.0+ Scatter Points ---
 show_m6_scatter = st.sidebar.checkbox("Show M ≥ 6.0 Earthquake Points", value=True)
+
+# --- Filter 5: Show Tectonic Plates ---
+show_plates = st.sidebar.checkbox("Show Tectonic Plates", value=False)
 
 # -----------------------------------------------------------------------------
 # 3. APPLY FILTERS TO DATAFRAME
@@ -102,6 +125,10 @@ elif isinstance(date_range, tuple) and len(date_range) == 1:
 if search_location:
     df_filtered = df_filtered[df_filtered['Place'].str.contains(search_location, case=False, na=False)]
 
+# Apply Country filter
+if selected_countries:
+    df_filtered = df_filtered[df_filtered['Country'].isin(selected_countries)]
+
 # -----------------------------------------------------------------------------
 # 4. MAIN LAYOUT & RENDERING
 # -----------------------------------------------------------------------------
@@ -111,7 +138,7 @@ st.title("Earthquake Hazard Density Analysis")
 col1, col2, col3 = st.columns(3)
 col1.metric("Total Events Displayed", len(df_filtered))
 if not df_filtered.empty:
-    col2.metric("Max Magnitude", f"M {df_filtered['Magnitude'].max():.1f}")
+    col2.metric("Max Magnitude", f"{df_filtered['Magnitude'].max():.1f}")
     col3.metric("Avg Depth", f"{df_filtered['Depth (km)'].mean():.1f} km")
 else:
     col2.metric("Max Magnitude", "N/A")
@@ -158,7 +185,9 @@ if not df_filtered.empty:
         Max_Mag_Date=('Date', 'first'),
         Area_Details=('Place', 'first'), 
         Lat_Center=('Latitude', 'mean'), 
-        Lon_Center=('Longitude', 'mean')
+        Lon_Center=('Longitude', 'mean'),
+        Total_Dead=('dead', 'sum'),
+        Total_Injured=('injured', 'sum')
     ).reset_index()
 
     # 4. Overlay invisible interactive markers for general area hover info
@@ -167,7 +196,9 @@ if not df_filtered.empty:
         <div style="font-family: sans-serif; font-size: 14px; min-width: 200px;">
             <b>Area:</b> {row['Area_Details']}<br>
             <b>Earthquakes in Area:</b> {row['Num_Earthquakes']}<br>
-            <b>Highest Magnitude:</b> M {row['Max_Mag']} (on {row['Max_Mag_Date']})
+            <b>Highest Magnitude:</b> M {row['Max_Mag']} (on {row['Max_Mag_Date']})<br>
+            <b>Total Dead (Area):</b> {row['Total_Dead']}<br>
+            <b>Total Injured (Area):</b> {row['Total_Injured']}
         </div>
         """
         
@@ -207,7 +238,9 @@ if not df_filtered.empty:
                     <b>Location:</b> {row['Place']}<br>
                     <b>Date:</b> {row['Date']}<br>
                     <b>Depth:</b> {row['Depth (km)']} km<br>
-                    <b>Coords:</b> {row['Latitude']:.4f}, {row['Longitude']:.4f}
+                    <b>Coords:</b> {row['Latitude']:.4f}, {row['Longitude']:.4f}<br>
+                    <b>Dead:</b> {row['dead']}<br>
+                    <b>Injured:</b> {row['injured']}
                 </div>
                 """
                 
@@ -221,15 +254,40 @@ if not df_filtered.empty:
                     fill_opacity=0.9,
                     tooltip=m6_tooltip_html
                 ).add_to(m)
+
+    # 6. Overlay Tectonic Plates if checked
+    if show_plates:
+        try:
+            with open("plates.geojson", "r", encoding="utf-8") as f:
+                plates_data = json.load(f)
+            
+            folium.GeoJson(
+                plates_data,
+                name="Tectonic Plates",
+                style_function=lambda feature: {
+                    'color': '#2C3E50',
+                    'weight': 2.5,
+                    'opacity': 0.8,
+                    'dashArray': '5, 5'
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=['plate1', 'plate2', 'type', 'feature', 'length'],
+                    aliases=['Plate 1:', 'Plate 2:', 'Boundary Type:', 'Feature Name:', 'Length:'],
+                    localize=True,
+                    style=("background-color: white; color: #333333; font-family: arial; font-size: 13px; padding: 10px;")
+                )
+            ).add_to(m)
+        except Exception as e:
+            st.error(f"Error loading plates.geojson: {e}")
     
-    # 6. Render map back into Streamlit canvas
+    # 7. Render map back into Streamlit canvas
     st_folium(m, width=1400, height=500, returned_objects=[])
     
     st.markdown("---")
     
     st.subheader("Data Details")
     st.dataframe(
-        df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date']], 
+        df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'tsunami', 'mmi', 'mmi_level', 'dead', 'injured', 'impact']], 
         use_container_width=True, 
         hide_index=True
     )
