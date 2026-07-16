@@ -9,53 +9,133 @@ st.set_page_config(layout="wide", page_title="Earthquake Monitoring Dashboard")
 # -----------------------------------------------------------------------------
 # 1. FAST DATA LOADING (Vectorized)
 # -----------------------------------------------------------------------------
+# @st.cache_data
+# def load_data(filepath="data.geojson"):
+#     try:
+#         with open(filepath, "r", encoding="utf-8") as f:
+#             geo_data = json.load(f)
+#     except Exception as e:
+#         st.error(f"Error loading file: {e}")
+#         return pd.DataFrame()
+
+#     table_rows = []
+    
+#     # Helper to clean numeric values quickly
+#     def clean_num(val):
+#         if val == '-' or val is None: return 0
+#         try: return int(float(val))
+#         except: return 0
+
+#     for feature in geo_data.get('features', []):
+#         props = feature.get('properties', {})
+#         coords = feature.get('geometry', {}).get('coordinates', [0, 0, 0])
+        
+#         table_rows.append({
+#             'Magnitude': props.get('mag'),
+#             'Place': props.get('place'),
+#             'Depth (km)': coords[2],
+#             'time_str': props.get('time'),  # Keep as string for fast vectorized parsing
+#             'Latitude': coords[1],
+#             'Longitude': coords[0],
+#             'Country': props.get('country'),
+#             'tsunami': props.get('tsunami'),
+#             'mmi': props.get('mmi'),
+#             'mmi_level': props.get('mmi_level'),
+#             'dead': clean_num(props.get('dead')),
+#             'injured': clean_num(props.get('injured')),
+#             'impact': props.get('impact')
+#         })
+        
+#     df = pd.DataFrame(table_rows)
+    
+#     if not df.empty:
+#         # Fast vectorized date conversion
+#         df['Date'] = pd.to_datetime(df['time_str'], format='ISO8601', errors='coerce').dt.date
+#         df = df.drop(columns=['time_str'])
+        
+#     return df
+
 @st.cache_data
-def load_data(filepath="data.geojson"):
+def load_data(geojson_path="data.geojson", csv_path="victims.csv"):
+    # 1. Load GeoJSON
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(geojson_path, "r", encoding="utf-8") as f:
             geo_data = json.load(f)
+        
+        # Convert features to a DataFrame
+        features = geo_data.get('features', [])
+        data_list = []
+        for f in features:
+            props = f.get('properties', {})
+            # Extract coordinates for lat/lon
+            coords = f.get('geometry', {}).get('coordinates', [0, 0, 0])
+            props['Latitude'] = coords[1]
+            props['Longitude'] = coords[0]
+            props['Depth (km)'] = coords[2]
+            data_list.append(props)
+        
+        df_geojson = pd.DataFrame(data_list)
     except Exception as e:
-        st.error(f"Error loading file: {e}")
+        st.error(f"Error loading GeoJSON: {e}")
         return pd.DataFrame()
 
-    table_rows = []
-    
-    # Helper to clean numeric values quickly
-    def clean_num(val):
-        if val == '-' or val is None: return 0
-        try: return int(float(val))
-        except: return 0
+    # 2. Load CSV
+    try:
+        df_victims = pd.read_csv(csv_path)
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}")
+        return pd.DataFrame()
 
-    for feature in geo_data.get('features', []):
-        props = feature.get('properties', {})
-        coords = feature.get('geometry', {}).get('coordinates', [0, 0, 0])
-        
-        table_rows.append({
-            'Magnitude': props.get('mag'),
-            'Place': props.get('place'),
-            'Depth (km)': coords[2],
-            'time_str': props.get('time'),  # Keep as string for fast vectorized parsing
-            'Latitude': coords[1],
-            'Longitude': coords[0],
-            'Country': props.get('country'),
-            'tsunami': props.get('tsunami'),
-            'mmi': props.get('mmi'),
-            'mmi_level': props.get('mmi_level'),
-            'dead': clean_num(props.get('dead')),
-            'injured': clean_num(props.get('injured')),
-            'impact': props.get('impact')
-        })
-        
-    df = pd.DataFrame(table_rows)
+    # 3. Prepare for Merge
+    # Columns to merge on
+    merge_cols = ['date', 'month', 'year', 'country', 'km', 'mag']
     
-    if not df.empty:
-        # Fast vectorized date conversion
-        df['Date'] = pd.to_datetime(df['time_str'], format='ISO8601', errors='coerce').dt.date
-        df = df.drop(columns=['time_str'])
+    # Ensure types match across both DataFrames for the merge columns
+    for col in merge_cols:
+        df_geojson[col] = df_geojson[col].astype(str)
+        df_victims[col] = df_victims[col].astype(str)
         
+    # 4. Merge
+    df = pd.merge(df_geojson, df_victims, on=merge_cols, how='left')
+    df = df.rename(columns={'mag':'Magnitude', 'place':'Place', 'time':'Time', 'mmi':'MMI', 'tsunami':'Tsunami', 'type':'Type', 
+                       'title':'Title', 'country':'Country', 'impact':'Impact', 'dead':'Dead', 'injured':'Injured', 'mmi_level':'MMI_Level'})
+    
+    # --- TYPE CONVERSION FIX ---
+    # Ensure numeric columns are actually numeric
+    df['Magnitude'] = pd.to_numeric(df['Magnitude'], errors='coerce')
+    df['Depth (km)'] = pd.to_numeric(df['Depth (km)'], errors='coerce')
+    df['Dead'] = pd.to_numeric(df['Dead'], errors='coerce').fillna(0)
+    df['Injured'] = pd.to_numeric(df['Injured'], errors='coerce').fillna(0)
+    # ---------------------------
+    
+    # Clean up impact columns (replace NaN with placeholders)
+    fill_cols = ['Impact', 'MMI_Level']
+    for col in fill_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("-")
+            
+    # 5. Format Date
+    df['Date'] = pd.to_datetime(df['Time'], format='ISO8601', errors='coerce').dt.date
+    
     return df
+        
+    # # 4. Merge
+    # df = pd.merge(df_geojson, df_victims, on=merge_cols, how='left')
+    
+    # # Clean up impact columns (replace NaN with placeholders if needed)
+    # fill_cols = ['dead', 'injured', 'impact', 'mmi_level']
+    # for col in fill_cols:
+    #     if col in df.columns:
+    #         df[col] = df[col].fillna("-")
+            
+    # # 5. Format Date
+    # # 'time' is available from GeoJSON; ensure Date column exists
+    # df['Date'] = pd.to_datetime(df['time'], format='ISO8601', errors='coerce').dt.date
+    
+    # return df
 
 df_raw = load_data()
+print(df_raw.columns)
 
 if df_raw.empty:
     st.warning("No data found or failed to parse.")
@@ -109,9 +189,9 @@ st.title("Earthquake Hazard Density Analysis")
 
 # Calculate totals for the metrics
 total_events = len(df_filtered)
-total_tsunami = int(pd.to_numeric(df_filtered['tsunami'], errors='coerce').fillna(0).sum())
-total_dead = int(df_filtered['dead'].sum())
-total_injured = int(df_filtered['injured'].sum())
+total_tsunami = int(pd.to_numeric(df_filtered['Tsunami'], errors='coerce').fillna(0).sum())
+total_dead = int(df_filtered['Dead'].sum())
+total_injured = int(df_filtered['Injured'].sum())
 
 # Display metrics in two rows
 row1 = st.columns(6)
@@ -160,8 +240,8 @@ if not df_filtered.empty:
         Area_Details=('Place', 'first'), 
         Lat_Center=('Latitude', 'mean'), 
         Lon_Center=('Longitude', 'mean'),
-        Total_Dead=('dead', 'sum'),
-        Total_Injured=('injured', 'sum')
+        Total_Dead=('Dead', 'sum'),
+        Total_Injured=('Injured', 'sum')
     ).reset_index()
 
     hover_texts = [
@@ -194,8 +274,8 @@ if not df_filtered.empty:
                 f"<b>Date:</b> {row['Date']}<br>"
                 f"<b>Depth:</b> {row['Depth (km)']} km<br>"
                 f"<b>Coords:</b> {row['Latitude']:.4f}, {row['Longitude']:.4f}<br>"
-                f"<b>Dead:</b> {row['dead']}<br>"
-                f"<b>Injured:</b> {row['injured']}"
+                f"<b>Dead:</b> {row['Dead']}<br>"
+                f"<b>Injured:</b> {row['Injured']}"
                 for _, row in df_m7.iterrows()
             ]
 
@@ -282,19 +362,11 @@ if not df_filtered.empty:
     
     st.markdown("---")
     
-    # st.subheader("Data Details")
-    # st.dataframe(
-    #     df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'tsunami', 'mmi', 'mmi_level', 'dead', 'injured', 'impact']]\
-    #         .rename(columns={'tsunami':'Tsunami', 'mmi':'MMI', 'mmi_level':'Level', 'dead':'Dead', 'injured':'Injured', 'impact':'Impact'}), 
-    #     width='stretch', 
-    #     hide_index=True
-    # )
-    
     st.subheader("Data Details")
     
     # 1. Create a copy of the specific columns you want to display
-    df_display = df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'tsunami', 'mmi', 'mmi_level', 'dead', 'injured', 'impact']].copy()\
-        .rename(columns={'tsunami':'Tsunami', 'mmi':'MMI', 'mmi_level':'Level', 'dead':'Dead', 'injured':'Injured', 'impact':'Impact'})
+    df_display = df_filtered[['Magnitude', 'Place', 'Depth (km)', 'Date', 'Tsunami', 'MMI', 'Dead', 'Injured', 'Impact']].copy()\
+        #.rename(columns={'tsunami':'Tsunami', 'mmi':'MMI', 'mmi_level':'Level', 'dead':'Dead', 'injured':'Injured', 'impact':'Impact'})
     
     st.dataframe(
         df_display, 
@@ -302,36 +374,5 @@ if not df_filtered.empty:
         hide_index=True
     )
     
-    # # 2. Calculate the totals
-    # total_eq = len(df_filtered)
-    # # Safely convert tsunami to numeric in case it contains None or strings, then sum
-    # total_tsunami = pd.to_numeric(df_filtered['tsunami'], errors='coerce').fillna(0).sum()
-    # total_dead = df_filtered['dead'].sum()
-    # total_injured = df_filtered['injured'].sum()
-    
-    # # 3. Create a summary row mapping the totals to the correct columns
-    # summary_row = pd.DataFrame([{
-    #     'Magnitude': None, 
-    #     'Place': f"TOTAL ({total_eq} earthquakes)", 
-    #     'Depth (km)': None, 
-    #     'Date': None, 
-    #     'Tsunami': int(total_tsunami), 
-    #     'MMI': None, 
-    #     'Level': None, 
-    #     'Dead': int(total_dead), 
-    #     'Injured': int(total_injured), 
-    #     'Impact': None
-    # }])
-    
-    # # 4. Append the summary row to the bottom of the display dataframe
-    # df_display = pd.concat([df_display, summary_row], ignore_index=True)
-    
-    # st.markdown("**(Summary)**")
-    # st.dataframe(
-    #     summary_row, 
-    #     width='stretch', 
-    #     hide_index=True,
-    #     hide_header
-    # )
 else:
     st.info("No earthquake records match the selected sidebar filters. Try expanding your search bounds.")
