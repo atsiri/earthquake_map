@@ -219,9 +219,9 @@ if not df_filtered.empty:
         lat=df_filtered['Latitude'],
         lon=df_filtered['Longitude'],
         z=[1] * len(df_filtered), 
-        radius=15,
+        radius=10,
         colorscale=[[0, 'rgba(0,0,255,0)'], [0.5, 'blue'], [0.6, 'cyan'], [0.7, 'green'], [0.8, 'yellow'], [0.9, 'orange'], [1.0, 'red']],
-        opacity=0.3,
+        opacity=0.2,
         showscale=False,
         hoverinfo='skip',
         name='Density'
@@ -335,7 +335,7 @@ if not df_filtered.empty:
                 lon=p_lons,
                 mode='lines',
                 line=dict(width=1, color="#5D4B3B"),
-                opacity=0.3,
+                opacity=0.5,
                 text=p_texts,
                 hoverinfo='text',
                 name='Tectonic Plates'
